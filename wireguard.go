@@ -63,12 +63,6 @@ func createIPCRequest(conf *DeviceConfig) (*DeviceSetting, error) {
 	return setting, nil
 }
 
-// VirtualTun stores a reference to netstack network and DNS configuration
-type VirtualTun struct {
-	tnet      *netstack.Net
-	systemDNS bool
-}
-
 func StartWireguard(conf *DeviceConfig) (*VirtualTun, error) {
 	setting, err := createIPCRequest(conf)
 	if err != nil {
@@ -91,8 +85,14 @@ func StartWireguard(conf *DeviceConfig) (*VirtualTun, error) {
 		return nil, err
 	}
 
+	ns, err := tnet.NetworkStack()
+	if err != nil {
+		return nil, err
+	}
 	return &VirtualTun{
 		tnet:      tnet,
+		ns:        ns,
+		localAddr: conf.Endpoint,
 		systemDNS: len(setting.dns) == 0,
 	}, nil
 }

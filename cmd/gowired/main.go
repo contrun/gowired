@@ -9,12 +9,16 @@ import (
 func main() {
 	deviceConfig, err := gowired.GetDeviceConfig()
 	if err != nil {
-		log.Fatalf("Unable to get device config %s", err)
+		log.Fatalf("Unable to get device config %v", err)
 	}
-	_, err = gowired.StartWireguard(deviceConfig)
+	vt, err := gowired.StartWireguard(deviceConfig)
 	if err != nil {
-		log.Fatalf("Unable to start wireguard server %s", err)
+		log.Fatalf("Unable to start wireguard server %v", err)
 	}
 
+	err = vt.SetupForwarding()
+	if err != nil {
+		log.Fatalf("Unable to setup forwarding %v", err)
+	}
 	select {}
 }
