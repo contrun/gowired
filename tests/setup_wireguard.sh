@@ -56,7 +56,7 @@ start() {
         wg set "$interface" peer "$(cat "$(get_pk "$j")")" endpoint 127.0.0.1:"$(get_port "$j")" allowed-ips "$(get_ip "$j" | awk -F/ '{print $1}')"
       fi
     done
-    wg set "$interface" peer "$(cat "$(get_pk 0)")" allowed-ips "$(get_ip 0)"
+    wg set "$interface" peer "$(cat "$(get_pk 0)")" allowed-ips 0.0.0.0/0
     ip link set "$interface" up
   done
   echo module wireguard +p > /sys/kernel/debug/dynamic_debug/control
