@@ -12,6 +12,8 @@ import (
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -29,7 +31,13 @@ func (vt *VirtualTun) SetupForwarding() error {
 	// incoming packets. The NIC won't receive anything it isn't meant to
 	// since WireGuard will only send us packets that are meant for us.
 	vt.ns.SetPromiscuousMode(wgNicID, true)
-	// Add IPv4 and IPv6 default routes, so all incoming packets from the Tailscale side
+	// This is needed because when a new connection is send to netstack NIC
+	// we need to CreateEndpoint for that connection and if spoofing is not
+	// set, CreateEndpoint would fail with ErrNoRoute
+	vt.ns.SetSpoofing(wgNicID, true)
+	vt.ns.NICForwarding(wgNicID, ipv4.ProtocolNumber)
+	vt.ns.NICForwarding(wgNicID, ipv6.ProtocolNumber)
+	// Add IPv4 and IPv6 default routes, so all incoming packets from vpn side
 	// are handled by the one fake NIC we use.
 	ipv4Subnet, _ := tcpip.NewSubnet(tcpip.Address(strings.Repeat("\x00", 4)), tcpip.AddressMask(strings.Repeat("\x00", 4)))
 	ipv6Subnet, _ := tcpip.NewSubnet(tcpip.Address(strings.Repeat("\x00", 16)), tcpip.AddressMask(strings.Repeat("\x00", 16)))
@@ -59,7 +67,7 @@ func (vt *VirtualTun) acceptUDP(r *udp.ForwarderRequest) {
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
-		log.Printf("acceptUDP: could not create endpoint: %v", err)
+		log.Printf("acceptUDP: could not create endpoint for %s: %v", stringifyTEI(sess), err)
 		return
 	}
 	dstAddr, ok := ipPortOfNetstackAddr(sess.LocalAddress, sess.LocalPort)
