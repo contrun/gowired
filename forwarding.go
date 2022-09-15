@@ -3,6 +3,7 @@ package gowired
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/netip"
@@ -15,6 +16,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -55,10 +57,115 @@ func (vt *VirtualTun) SetupForwarding() error {
 	// size = 0 means use default buffer size
 	const tcpReceiveBufferSize = 0
 	const maxInFlightConnectionAttempts = 16
+	tcpFwd := tcp.NewForwarder(vt.ns, tcpReceiveBufferSize, maxInFlightConnectionAttempts, vt.acceptTCP)
+	vt.ns.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 	udpFwd := udp.NewForwarder(vt.ns, vt.acceptUDP)
 	vt.ns.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 
 	return nil
+}
+
+func (vt *VirtualTun) acceptTCP(r *tcp.ForwarderRequest) {
+	sess := r.ID()
+	log.Printf("[v2] TCP ForwarderRequest: %s\n", stringifyTEI(sess))
+	clientRemoteIP, ok := ipOfNetstackAddr(sess.RemoteAddress)
+	if !ok {
+		log.Printf("invalid RemoteAddress in TCP ForwarderRequest: %s", stringifyTEI(sess))
+		r.Complete(true) // sends a RST
+		return
+	}
+
+	dialAddr, ok := ipPortOfNetstackAddr(sess.LocalAddress, sess.LocalPort)
+	if !ok {
+		log.Printf("invalid RemoteAddress in TCP ForwarderRequest: %s", stringifyTEI(sess))
+		r.Complete(true) // sends a RST
+		return
+	}
+
+	var wq waiter.Queue
+	ep, err := r.CreateEndpoint(&wq)
+	if err != nil {
+		log.Printf("CreateEndpoint error for %s: %v", stringifyTEI(sess), err)
+		r.Complete(true) // sends a RST
+		return
+	}
+	r.Complete(false)
+
+	// SetKeepAlive so that idle connections to peers that have forgotten about
+	// the connection or gone completely offline eventually time out.
+	// Applications might be setting this on a forwarded connection, but from
+	// userspace we can not see those, so the best we can do is to always
+	// perform them with conservative timing.
+	// TODO(tailscale/tailscale#4522): Netstack defaults match the Linux
+	// defaults, and results in a little over two hours before the socket would
+	// be closed due to keepalive. A shorter default might be better, or seeking
+	// a default from the host IP stack. This also might be a useful
+	// user-tunable, as in userspace mode this can have broad implications such
+	// as lingering connections to fork style daemons. On the other side of the
+	// fence, the long duration timers are low impact values for battery powered
+	// peers.
+	ep.SocketOptions().SetKeepAlive(true)
+
+	// The ForwarderRequest.CreateEndpoint above asynchronously
+	// starts the TCP handshake. Note that the gonet.TCPConn
+	// methods c.RemoteAddr() and c.LocalAddr() will return nil
+	// until the handshake actually completes. But we have the
+	// remote address in reqDetails instead, so we don't use
+	// gonet.TCPConn.RemoteAddr. The byte copies in both
+	// directions to/from the gonet.TCPConn in forwardTCP will
+	// block until the TCP handshake is complete.
+	c := gonet.NewTCPConn(&wq, ep)
+
+	vt.forwardTCP(c, &wq, clientRemoteIP, dialAddr)
+}
+
+func (vt *VirtualTun) forwardTCP(client *gonet.TCPConn, wq *waiter.Queue, clientIP netip.Addr, dstAddr netip.AddrPort) {
+	defer client.Close()
+	isLocal := vt.isLocalIP(dstAddr.Addr())
+	if isLocal {
+		dstAddr = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), dstAddr.Port())
+	}
+	dialAddrStr := dstAddr.String()
+	log.Printf("[v2] netstack: forwarding incoming connection to %s", dialAddrStr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.EventHUp) // TODO(bradfitz): right EventMask?
+	wq.EventRegister(&waitEntry)
+	defer wq.EventUnregister(&waitEntry)
+	done := make(chan bool)
+	// netstack doesn't close the notification channel automatically if there was no
+	// hup signal, so we close done after we're done to not leak the goroutine below.
+	defer close(done)
+	go func() {
+		select {
+		case <-notifyCh:
+			log.Printf("[v2] netstack: forwardTCP notifyCh fired; canceling context for %s", dialAddrStr)
+		case <-done:
+		}
+		cancel()
+	}()
+	var stdDialer net.Dialer
+	server, err := stdDialer.DialContext(ctx, "tcp", dialAddrStr)
+	if err != nil {
+		log.Printf("netstack: could not connect to local server at %s: %v", dialAddrStr, err)
+		return
+	}
+	defer server.Close()
+	connClosed := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(server, client)
+		connClosed <- err
+	}()
+	go func() {
+		_, err := io.Copy(client, server)
+		connClosed <- err
+	}()
+	err = <-connClosed
+	if err != nil {
+		log.Printf("proxy connection closed with error: %v", err)
+	}
+	log.Printf("[v2] netstack: forwarder connection to %s closed", dialAddrStr)
 }
 
 func (vt *VirtualTun) acceptUDP(r *udp.ForwarderRequest) {
@@ -196,6 +303,11 @@ func ipPortOfNetstackAddr(a tcpip.Address, port uint16) (ipp netip.AddrPort, ok 
 	default:
 		return ipp, false
 	}
+}
+
+func ipOfNetstackAddr(a tcpip.Address) (ip netip.Addr, ok bool) {
+	addr, ok := ipPortOfNetstackAddr(a, 0)
+	return addr.Addr(), ok
 }
 
 func stringifyTEI(tei stack.TransportEndpointID) string {
